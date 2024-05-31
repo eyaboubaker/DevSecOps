@@ -1,1 +1,149 @@
+def COLOR_MAP = [
+    'FAILURE' : 'danger',
+    'SUCCESS' : 'good'
+]
+pipeline{
+    agent any
+    tools{
+        jdk 'jdk17'
+        maven 'maven3'
+    }
+    environment {
+        SCANNER_HOME=tool 'sonar-scanner'
+    }
+    stages {
+        stage('Checkout From Git'){
+            steps{
+                git branch: 'master', url: 'https://github.com/eyaboubaker/Devscops.git'
+            }
+        }
+        stage('mvn compile'){
+            steps{
+                sh 'mvn clean compile'
+            }
+        }
+        stage('mvn test'){
+            steps{
+                sh 'mvn test -DskipTests=true'
+            }
+        }
+    stage('Lynis Security Scan') {
+        steps {
+            script {
+        // Exécutez le balayage de sécurité Lynis et convertissez la sortie en HTML
+        sh 'lynis audit system | ansi2html > lynis-report.html'
 
+
+       // Affiche le chemin absolu du fichier de rapport dans la console de sortie Jenkins
+                    def reportPath = "${WORKSPACE}/lynis-report.html"
+                    echo "Chemin du rapport Lynis : ${reportPath}"
+
+// Archive le fichier de rapport pour qu'il soit accessible après la construction
+                    archiveArtifacts artifacts: 'lynis-report.html'
+    }
+}
+}
+stage('OWASP FS SCAN') {
+            steps {
+                dependencyCheck additionalArguments: '--scan ./' , odcInstallation: 'DC'
+                dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
+            }
+        }
+
+        stage("Sonarqube Analysis "){
+            steps{
+                withSonarQubeEnv('sonar-server') {
+                    sh ''' $SCANNER_HOME/bin/sonar-scanner -Dsonar.projectName=EKART \
+                    -Dsonar.java.binaries=. \
+                    -Dsonar.projectKey=EKART '''
+                }
+            }
+        }
+        stage('Build'){
+            steps{
+                sh "mvn package -DskipTests=true "
+        }
+        }
+        stage('Publish To Nexus') {
+            steps {
+               withMaven(globalMavenSettingsConfig: 'global-maven', jdk: 'jdk17', maven: 'maven3', mavenSettingsConfig: '', traceability: true) {
+                    sh "mvn deploy -DskipTests=true"
+                }
+            }
+        }
+        stage('Build & Tag Docker Image') {
+            steps {
+               script {
+                   withDockerRegistry(credentialsId: 'docker-cred', toolName: 'Docker') {
+                            sh "docker build -t boubakereya22/ekart:latest -f docker/Dockerfile ."
+                    }
+               }
+            }
+        }
+     stage('TRIVY') {
+            steps {
+                script {
+                    // Effectue le balayage de sécurité de l'image et écrit la sortie dans un fichier HTML
+                    sh 'trivy image --format table --timeout 5m -o trivy-image-report.html boubakereya22/ekart:latest'
+
+                    // Affiche le chemin absolu du fichier de rapport dans la console de sortie Jenkins
+                    def reportPath = "${WORKSPACE}/trivy-image-report.html"
+                    echo "Chemin du rapport Trivy : ${reportPath}"
+
+                    // Archive le fichier de rapport pour qu'il soit accessible après la construction
+                    archiveArtifacts artifacts: 'trivy-image-report.html'
+                }
+            }
+        }
+        stage('Push Docker Image') {
+            steps {
+              script {
+                  withDockerRegistry(credentialsId: 'docker-cred', toolName: 'Docker') {
+                            sh "docker push boubakereya22/ekart:latest"
+                    }
+              }
+            }
+        }
+        stage('Deploy To Kubernetes') {
+            steps {
+              withKubeConfig(caCertificate: '', clusterName: '', contextName: '', credentialsId: 'k3s-cred', namespace: 'webapps', restrictKubeConfigAccess: false, serverUrl: 'https://192.168.0.8:6443') {
+                        sh "kubectl apply -f deploymentservice.yml"
+
+                }
+            }
+        }
+        
+        stage('Verify the Deployment') {
+            steps {
+              withKubeConfig(caCertificate: '', clusterName: '', contextName: '', credentialsId: 'k3s-cred', namespace: 'webapps', restrictKubeConfigAccess: false, serverUrl: 'https://192.168.0.8:6443') {
+                        sh "kubectl get pods -n webapps"
+                        sh "kubectl get svc -n webapps"
+                }
+            }
+        }
+         stage('Nikto Security Scan') {
+            steps {
+                 script {
+                // Exécuter Nikto et enregistrer la sortie dans nikto-report.html dans le répertoire de travail
+                sh 'nikto -h https://192.168.0.9:8070 -o Nikto-report.html'
+                 // Affiche le chemin absolu du fichier de rapport dans la console de sortie Jenkins
+                    def reportPath = "${WORKSPACE}/Nikto-report.html"
+                    echo "Chemin du rapport Nikto : ${reportPath}"
+
+                 // Archive le fichier de rapport pour qu'il soit accessible après la construction
+                    archiveArtifacts artifacts:'Nikto-report.html'
+            }
+        }
+         }
+}      
+    post {
+    always {
+        echo 'Slack Notifications'
+        slackSend (
+            channel: '#jenkins', 
+            color: COLOR_MAP[currentBuild.currentResult],
+            message: "${currentBuild.currentResult}: Job ${env.JOB_NAME} \n build ${env.BUILD_NUMBER} \n More info at: ${env.BUILD_URL}"
+        )
+    }
+}
+}
